@@ -6,6 +6,8 @@ import re
 import urllib.parse as ul
 from typing import Callable, List, Optional, Tuple, Union
 
+import numpy as np
+
 from opensora.acceleration.communications import AllGather
 from opensora.acceleration.parallel_states import get_sequence_parallel_state, hccl_info
 
@@ -518,6 +520,24 @@ class OpenSoraPipeline(DiffusionPipeline):
         latents = latents * self.scheduler.init_noise_sigma
         return latents
 
+    def prepare_parallel_latent(self, video_states):
+        sp_size = hccl_info.world_size
+        index = hccl_info.rank % sp_size
+        padding_needed = (sp_size - video_states.shape[2] % sp_size) % sp_size
+        temp_attention_mask = None
+        if padding_needed > 0:
+            logger.debug("Doing video padding")
+            # B, C, T, H, W -> B, C, T', H, W
+            video_states = ops.pad(video_states, (0, 0, 0, 0, 0, padding_needed), mode="constant", value=0)
+
+            b, _, f, h, w = video_states.shape
+            temp_attention_mask = ops.ones((b, f), ms.int32)
+            temp_attention_mask[:, -padding_needed:] = 0
+
+        assert video_states.shape[2] % sp_size == 0
+        video_states = ops.chunk(video_states, sp_size, 2)[index]
+        return video_states, temp_attention_mask
+
     def __call__(
         self,
         prompt: Union[str, List[str]] = None,
@@ -678,24 +698,16 @@ class OpenSoraPipeline(DiffusionPipeline):
 
         # 5. Prepare latents.
         latent_channels = self.transformer.config.in_channels
-        world_size = hccl_info.world_size
         latents = self.prepare_latents(
             batch_size * num_images_per_prompt,
             latent_channels,
-            (num_frames + world_size - 1) // world_size if get_sequence_parallel_state() else num_frames,
+            num_frames,
             height,
             width,
             prompt_embeds.dtype,
             generator,
             latents,
         )
-        if get_sequence_parallel_state():
-            # b (n x) h -> b n x h
-            prompt_embeds = prompt_embeds.reshape(
-                prompt_embeds.shape[0], world_size, prompt_embeds.shape[1] // world_size, -1
-            ).contiguous()
-            index = hccl_info.rank % world_size
-            prompt_embeds = prompt_embeds[:, index, :, :]
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -705,6 +717,25 @@ class OpenSoraPipeline(DiffusionPipeline):
 
         # 7. Denoising loop
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
+        world_size = hccl_info.world_size
+
+        if get_sequence_parallel_state():
+            latents, temp_attention_mask = self.prepare_parallel_latent(latents)
+            temp_attention_mask = (
+                ops.cat([temp_attention_mask] * 2)
+                if (do_classifier_free_guidance and temp_attention_mask is not None)
+                else temp_attention_mask
+            )
+            # b (n x) h -> b n x h
+            prompt_embeds = prompt_embeds.reshape(
+                prompt_embeds.shape[0], world_size, prompt_embeds.shape[1] // world_size, -1
+            ).contiguous()
+            index = hccl_info.rank % world_size
+            prompt_embeds = prompt_embeds[:, index, :, :]
+
+        else:
+            temp_attention_mask = None
+
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 latent_model_input = ops.cat([latents] * 2) if do_classifier_free_guidance else latents
@@ -727,6 +758,14 @@ class OpenSoraPipeline(DiffusionPipeline):
                     prompt_attention_mask = prompt_attention_mask.unsqueeze(1)  # b l -> b 1 l
                 # b c t h w -> b t h w
                 attention_mask = ops.ones_like(latent_model_input)[:, 0]  # b t h w
+                if temp_attention_mask is not None:
+                    # temp_attention_mask shape (bs, t), 1 means to keep, 0 means to discard
+                    # TODO: mask temporal padded tokens
+                    # temp_attention_mask = ops.broadcast(temp_attention_mask, attention_mask.shape).bool()
+                    # attention_mask[~temp_attention_mask] = 0
+
+                    attention_mask = (attention_mask.to(ms.int32) * temp_attention_mask[:, :, None, None].to(ms.int32)).to(ms.bool_)
+
                 if get_sequence_parallel_state():
                     attention_mask = attention_mask.tile((1, world_size, 1, 1))  # b t*sp_size h w
                 # predict noise model_output
@@ -764,6 +803,7 @@ class OpenSoraPipeline(DiffusionPipeline):
 
         if get_sequence_parallel_state():
             sp_size = hccl_info.world_size
+
             latents = self.all_gather(latents)
             latents_list = mint.chunk(latents, sp_size, 0)
             latents = ops.concat(latents_list, axis=2)[:, :, :num_frames]
@@ -773,6 +813,7 @@ class OpenSoraPipeline(DiffusionPipeline):
             image = image[:, :num_frames, :height, :width]
         else:
             image = latents
+
         if not return_dict:
             return (image,)
 
